@@ -1,12 +1,10 @@
-
-from flask import Blueprint, request, jsonify, send_file, url_for, current_app, make_response
+from flask import Blueprint, request, jsonify, send_file, url_for
 import pandas as pd
-import numpy as np
-import os, uuid, math, random
-from datetime import datetime
+import os, uuid
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from diffprivlib.mechanisms import Laplace, Gaussian, Exponential
 
 dp_bp = Blueprint("dp", __name__)
 
@@ -18,148 +16,165 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 os.makedirs(PLOT_FOLDER, exist_ok=True)
 
-#Utility DP mechanisms
-def laplace_mechanism_scalar(value, epsilon, sensitivity=1.0):
-    scale = sensitivity / max(epsilon, 1e-12)
-    noise = np.random.laplace(0.0, scale)
-    try:
-        return float(value) + noise
-    except Exception:
-        return value
 
-def gaussian_mechanism_scalar(value, epsilon, delta, sensitivity=1.0):
-    # Approximate sigma according to standard DP bound
-    if delta <= 0:
-        delta = 1e-12
-    sigma = math.sqrt(2 * math.log(1.25 / delta)) * (sensitivity / max(epsilon, 1e-12))
-    noise = np.random.normal(0.0, sigma)
-    try:
-        return float(value) + noise
-    except Exception:
-        return value
+def privatize_column_series(series, mechanism, epsilon, delta, auto=False):
+    print(f"[DEBUG] Privatizing column: {series.name}, mechanism={mechanism}, auto={auto}")
 
-def exponential_mechanism_categorical(value, epsilon, categories):
-    # Simple randomized response style exponential mechanism (not exact formal score)
-    # Bias to keep original with higher prob
-    if not categories:
-        return value
-    if random.random() < 0.7:
-        return value
-    else:
-        return random.choice(categories)
+    # uto-detect column type
+    if auto:
+        try_numeric = pd.to_numeric(series, errors="coerce")  # don’t cast to str first
+        numeric_fraction = try_numeric.notna().sum() / max(1, len(series))
+        print(f"[DEBUG] {series.name} numeric fraction: {numeric_fraction:.2f}")
 
-#apply noise to column values
-def privatize_column_series(series, mechanism, epsilon, delta):
-    """Return new series with per-value noise applied according to mechanism."""
-    if pd.api.types.is_numeric_dtype(series):
-        if mechanism == "laplace":
-            return series.apply(lambda x: laplace_mechanism_scalar(x, epsilon))
-        elif mechanism == "gaussian":
-            return series.apply(lambda x: gaussian_mechanism_scalar(x, epsilon, delta))
+        if numeric_fraction >= 0.8:  
+            mechanism = "laplace"  
+            series = try_numeric
         else:
-            # exponential on numeric -> fallback to laplace
-            return series.apply(lambda x: laplace_mechanism_scalar(x, epsilon))
+            mechanism = "exponential"
+
+    #Numeric Columns
+    if mechanism in ["laplace", "gaussian"]:
+        try:
+            numeric_series = pd.to_numeric(series, errors="coerce")
+            if numeric_series.notna().sum() == 0:
+                print(f"[WARN] Skipping {series.name} (no valid numeric values)")
+                return series
+
+            if mechanism == "laplace":
+                mech = Laplace(epsilon=epsilon, sensitivity=1)
+            else:
+                mech = Gaussian(epsilon=epsilon, delta=delta, sensitivity=1)
+
+            return numeric_series.apply(lambda x: mech.randomise(float(x)) if pd.notna(x) else x)
+
+        except Exception as e:
+            print(f"[ERROR] Numeric privatization failed for {series.name}: {e}")
+            return series
+
+    # Categorical / String Columns 
     else:
         categories = series.dropna().unique().tolist()
-        if mechanism == "exponential":
-            return series.apply(lambda x: exponential_mechanism_categorical(x, epsilon, categories))
-        else:
-            # for non-numeric with laplace/gaussian, just keep original or randomize slightly
-            return series.apply(lambda x: exponential_mechanism_categorical(x, epsilon, categories))
+        if not categories:
+            print(f"[WARN] Skipping {series.name} (no valid categories)")
+            return series
+        try:
+            counts = series.value_counts(dropna=True)
+            categories = counts.index.tolist()
 
-# Helper: plot comparison histogram
+            
+            def privatize_value(x):
+                utilities = []
+                for cat in categories:
+                    if cat == x:
+                        utilities.append(max(counts.values))  
+                    else:
+                        utilities.append(counts.get(cat, 0))
+                mech = Exponential(
+                    epsilon=epsilon,
+                    sensitivity=1,
+                    utility=utilities,
+                    candidates=categories
+                )
+                return mech.randomise(None)
+
+            return series.apply(lambda x: privatize_value(x) if pd.notna(x) else x)
+
+        except Exception as e:
+            print(f"[ERROR] Exponential privatization failed for {series.name}: {e}")
+        return series
+
+
+
 def make_hist_plot(orig_series, priv_series, file_id, column_name):
-    # numeric only: hist of original vs privatized
     plot_path = os.path.join(PLOT_FOLDER, f"{file_id}_{column_name}.png")
-    plt.figure(figsize=(6,4))
+    plt.figure(figsize=(6, 4))
     try:
         if pd.api.types.is_numeric_dtype(orig_series):
-            plt.hist(orig_series.dropna().astype(float), bins=30, alpha=0.5, label='original')
-            plt.hist(pd.to_numeric(priv_series.dropna(), errors='coerce').dropna(), bins=30, alpha=0.5, label='privatized')
+            # Numeric column: overlay histograms
+            plt.hist(orig_series.dropna().astype(float), bins=30, alpha=0.5, label="original")
+            plt.hist(pd.to_numeric(priv_series.dropna(), errors="coerce").dropna(),
+                     bins=30, alpha=0.5, label="privatized")
             plt.legend()
             plt.title(f"{column_name}: original vs privatized")
-            plt.tight_layout()
-            plt.savefig(plot_path)
-            plt.close()
-            return plot_path
         else:
-            # For categorical, show bar charts of top categories
-            orig_counts = orig_series.fillna("NULL").value_counts().nlargest(10)
-            priv_counts = priv_series.fillna("NULL").value_counts().reindex(orig_counts.index, fill_value=0)
+            # Categorical column: show all categories
+            orig_counts = orig_series.fillna("NULL").value_counts()
+            priv_counts = priv_series.fillna("NULL").value_counts()
+
+            # Include all categories from both original and privatized data
+            all_categories = list(set(orig_counts.index) | set(priv_counts.index))
+            orig_counts = orig_counts.reindex(all_categories, fill_value=0)
+            priv_counts = priv_counts.reindex(all_categories, fill_value=0)
+
+            # Create a side-by-side bar chart
             df = pd.DataFrame({"original": orig_counts, "privatized": priv_counts})
-            df.plot(kind='bar', figsize=(8,4))
-            plt.title(f"{column_name}: original vs privatized (top categories)")
-            plt.tight_layout()
-            plt.savefig(plot_path)
-            plt.close()
-            return plot_path
+            df.plot(kind="bar", figsize=(8, 4))
+            plt.title(f"{column_name}: original vs privatized (all categories)")
+
+        plt.tight_layout()
+        plt.savefig(plot_path)
+        plt.close()
+        return plot_path
+
     except Exception as e:
+        print(f"[ERROR] Plotting failed for {column_name}: {e}")
         plt.close()
         return None
 
-# Main analyze route
+
+
+# Analyze route
 @dp_bp.route("/analyze", methods=["POST"])
 def analyze():
-    
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    mechanism = request.form.get("mechanism", "laplace")
+    mechanism = request.form.get("mechanism", "laplace")  # used only for single-column mode
     epsilon = float(request.form.get("epsilon", 1.0))
     delta = float(request.form.get("delta", 1e-5))
-    scope = request.form.get("scope", "single_column")  
-    columns = request.form.getlist("columns")  
+    scope = request.form.get("scope", "single_column")
+    columns = request.form.getlist("columns")
 
     file_id = str(uuid.uuid4())
     uploaded_filename = f"{file_id}_input.csv"
     input_path = os.path.join(UPLOAD_FOLDER, uploaded_filename)
     file.save(input_path)
 
-    #load
     try:
         df = pd.read_csv(input_path)
     except Exception as e:
         return jsonify({"error": f"Failed to read CSV: {e}"}), 400
 
-    #Decide which columns to process
     if scope == "whole_file":
         cols_to_priv = df.columns.tolist()
+        auto = True   # force auto mechanism per column
     else:
-        if not columns:
-            #if none chosen, default to first numeric column
-            cols_to_priv = [df.columns[0]] if len(df.columns) > 0 else []
-        else:
-            cols_to_priv = columns
+        cols_to_priv = columns if columns else ([df.columns[0]] if len(df.columns) > 0 else [])
+        auto = False  # use selected mechanism from frontend
 
     cols_processed = []
     plot_urls = {}
-
     privatized_df = df.copy()
 
     for col in cols_to_priv:
         if col not in df.columns:
             continue
         orig_series = df[col]
-        #apply row-level per-value noise
-        new_series = privatize_column_series(orig_series, mechanism, epsilon, delta)
+        new_series = privatize_column_series(orig_series, mechanism, epsilon, delta, auto=auto)
         privatized_df[col] = new_series
         cols_processed.append(col)
-        #create plot for this column (if possible)
+
         plot_path = make_hist_plot(orig_series, new_series, file_id, col)
         if plot_path:
-            #serve via /dp/plot/<file_id>/<col>
             plot_urls[col] = request.host_url[:-1] + url_for("dp.plot_image", file_id=file_id, column_name=col)
-
         else:
             plot_urls[col] = None
 
-    #Save privatized CSV
     output_name = f"privatized_{file_id}.csv"
     output_path = os.path.join(OUTPUT_FOLDER, output_name)
     privatized_df.to_csv(output_path, index=False)
 
-    #Return response with download URL and plot map
     download_url = url_for("dp.download", file_id=file_id)
     return jsonify({
         "file_id": file_id,
@@ -169,7 +184,7 @@ def analyze():
     }), 200
 
 
-#Download endpoint
+# Download endpoint
 @dp_bp.route("/download/<file_id>", methods=["GET"])
 def download(file_id):
     filename = f"privatized_{file_id}.csv"
@@ -178,12 +193,11 @@ def download(file_id):
         return jsonify({"error": "File not found"}), 404
     return send_file(path, as_attachment=True, download_name="privatized.csv")
 
-#Plot image endpoint
+
+# Plot image endpoint
 @dp_bp.route("/plot/<file_id>/<column_name>", methods=["GET"])
 def plot_image(file_id, column_name):
     plot_path = os.path.join(PLOT_FOLDER, f"{file_id}_{column_name}.png")
     if not os.path.exists(plot_path):
         return jsonify({"error": "Plot not available"}), 404
-    # return image file
     return send_file(plot_path, mimetype="image/png")
-
