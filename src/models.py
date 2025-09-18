@@ -1,8 +1,29 @@
 from datetime import datetime
 from flask_sqlalchemy import SQLAlchemy
-from extensions import db
+from extensions import db  
 
+class DPResult(db.Model):
+    __tablename__ = "dp_results"
 
+    id = db.Column(db.Integer, primary_key=True)
+    file_id = db.Column(db.String(128), nullable=False) 
+    columns = db.Column(db.Text)  
+    mechanism = db.Column(db.String(64))
+    epsilon = db.Column(db.Float)
+    delta = db.Column(db.Float, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "file_id": self.file_id,
+            "columns": self.columns,
+            "mechanism": self.mechanism,
+            "epsilon": self.epsilon,
+            "delta": self.delta,
+            "created_at": self.created_at.isoformat(),
+        }
+    
 # Association table for Role-Permission
 class RolePermission(db.Model):
     __tablename__ = "role_permissions"
@@ -45,7 +66,8 @@ class AuditLog(db.Model):
     message = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-    user = db.relationship("User", backref=db.backref("audit_logs", lazy=True))
+    user = db.relationship("User", backref=db.backref("audit_logs", lazy=True))    
 
 def __repr__(self):
     return f"<User {self.email}>"
+

@@ -3,13 +3,14 @@ from flask import Flask, send_from_directory
 from extensions import db, migrate, jwt, cors
 from dotenv import load_dotenv
 from config import DevConfig
-from src.models import db as models_db  
+from src.models import DPResult
 from src.auth.routes import auth_bp
 from src.rbac.routes import rbac_bp
 from src.audit.logger import init_audit
 from src.audit.routes import audit_bp
 from src.api.routes import api_bp
 from src.dp.routes import dp_bp 
+
 
 def create_app():
     load_dotenv()
@@ -33,6 +34,7 @@ def create_app():
     app.register_blueprint(audit_bp)
     app.register_blueprint(api_bp)
     app.register_blueprint(dp_bp, url_prefix="/dp")
+    
 
     # Auditing after_request hook & file logging
     init_audit(app)
